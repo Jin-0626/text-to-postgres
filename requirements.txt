@@ -1,0 +1,5 @@
+pglast>=7,<8
+psycopg[binary]>=3.2,<4
+datasets>=3,<6
+huggingface_hub>=1,<2
+python-dotenv>=1,<2

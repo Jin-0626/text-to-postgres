@@ -1,0 +1,6 @@
+employees.employee(id bigint PK, birth_date date, first_name varchar(14), last_name varchar(16), gender enum M/F, hire_date date)
+employees.department(id char(4) PK, dept_name varchar(40) UNIQUE)
+employees.department_employee(employee_id bigint FK employee.id, department_id char(4) FK department.id, from_date date, to_date date; PK employee_id,department_id)
+employees.department_manager(employee_id bigint FK employee.id, department_id char(4) FK department.id, from_date date, to_date date; PK employee_id,department_id)
+employees.salary(employee_id bigint FK employee.id, amount bigint, from_date date, to_date date; PK employee_id,from_date)
+employees.title(employee_id bigint FK employee.id, title varchar(50), from_date date, to_date nullable date; PK employee_id,title,from_date)
