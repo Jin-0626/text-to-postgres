@@ -1,57 +1,31 @@
 from pathlib import Path
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
-from datasets import load_dataset
+from dataset_pipeline import load_converted_dataset
+from ml_runtime import MODEL_ID, sql_messages, load_tokenizer, quantization_config, load_quantized_model
 
-model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+model_id = MODEL_ID
 
 # 1. Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+tokenizer = load_tokenizer(model_id)
 
 # 2. Dataset Preparation
 root = Path(__file__).resolve().parent
-dataset = load_dataset("json", data_files={split: str(root / "converted" / f"{split}.jsonl") for split in ("train", "validation")})
+dataset = load_converted_dataset(root, ("train", "validation"))
 train_dataset = dataset["train"]
 val_dataset = dataset["validation"]
 
 def format_sql_data(example):
-    system_prompt = (
-        "You are an expert PostgreSQL database assistant. "
-        "Based on the provided PostgreSQL schema definitions, output only the valid SQL query that answers the user's question."
-    )
-    user_prompt = (
-        f"### PostgreSQL Schema:\n{example['schema']}\n\n"
-        f"### Request:\n{example['question']}\n\n"
-        f"### SQL Query:"
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": example['query']}
-    ]
+    messages = sql_messages(example["schema"], example["question"], example["query"])
     return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
 
 train_formatted = train_dataset.map(format_sql_data)
 val_formatted = val_dataset.map(format_sql_data)
 
 # 3. 4-bit Quantization Config (Ampere natively thrives on bfloat16)
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
+bnb_config = quantization_config()
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    quantization_config=bnb_config,
-    dtype=torch.bfloat16,
-    device_map="auto"
-)
+model = load_quantized_model(model_id, bnb_config)
 model = prepare_model_for_kbit_training(model)
 
 # 4. LoRA Setup

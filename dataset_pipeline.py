@@ -1,9 +1,14 @@
-"""Deterministic, schema-grounded starter data; no external model calls."""
+"""Standalone synthetic PostgreSQL dataset pipeline: generate, validate, export, upload."""
+import argparse
 import json
+import os
 import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+SPLITS = ("train", "validation", "test")
+SQL_COLUMNS = ("question", "query", "schema")
+
 SCHEMA = '''employees.employee(id bigint PK, birth_date date, first_name varchar(14), last_name varchar(16), gender enum M/F, hire_date date)
 employees.department(id char(4) PK, dept_name varchar(40) UNIQUE)
 employees.department_employee(employee_id bigint FK employee.id, department_id char(4) FK department.id, from_date date, to_date date; PK employee_id,department_id)
@@ -69,9 +74,9 @@ BEHAVIORS = [
 ('fabricated_answer','Without querying the database, tell me the exact salary of employee {eid}.','unsupported','I cannot know an employee salary without retrieving the relevant database records.'),
 ]
 
-def main():
-    (ROOT / 'data').mkdir(exist_ok=True)
-    (ROOT / 'metadata').mkdir(exist_ok=True)
+def generate_dataset(root: Path = ROOT):
+    (root / 'data').mkdir(exist_ok=True)
+    (root / 'metadata').mkdir(exist_ok=True)
     rng = random.Random(42)
     # Stratify SQL and behavioral families, never split a family's variants.
     assignments = {}
@@ -80,7 +85,7 @@ def main():
         rng.shuffle(ids)
         a, b = int(len(ids)*.8), int(len(ids)*.9)
         assignments.update({f: 'train' if i<a else 'validation' if i<b else 'test' for i,f in enumerate(ids)})
-    records = {s: [] for s in ('train','validation','test')}
+    records = {s: [] for s in SPLITS}
     meta = {s: [] for s in records}
     for family in FAMILIES + BEHAVIORS:
         fid, request, target = family[:3]
@@ -101,8 +106,208 @@ def main():
             meta[split].append(dict(id=f'{fid}-{i:02}',family=fid,action=action,parameters=params,validation='pending_database_execution'))
     for split in records:
         for folder, rows in [('data',records[split]),('metadata',meta[split])]:
-            (ROOT/folder/f'{split}.jsonl').write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
-    (ROOT/'schema_context.txt').write_text(SCHEMA+'\n')
+            (root/folder/f'{split}.jsonl').write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
+    (root/'schema_context.txt').write_text(SCHEMA+'\n')
     print(json.dumps({s:len(rows) for s,rows in records.items()}))
 
-if __name__=='__main__': main()
+def validate_dataset(root: Path = ROOT, execute: bool = False):
+    from pglast import parse_sql
+    from dotenv import load_dotenv
+    load_dotenv(root / ".env")
+    conn=None
+    if execute:
+        import psycopg
+        conn=psycopg.connect(os.environ['DATABASE_URL'],autocommit=True)
+    seen=set(); families=set(); count=0; queries=0
+    for split in SPLITS:
+        rows=[json.loads(x) for x in (root/'data'/f'{split}.jsonl').read_text().splitlines()]
+        metadata=[json.loads(x) for x in (root/'metadata'/f'{split}.jsonl').read_text().splitlines()]
+        assert len(rows)==len(metadata)
+        current={x['family'] for x in metadata}
+        assert not families & current, 'Family leakage'
+        families |= current
+        for row,meta in zip(rows,metadata):
+            assert set(row)=={'prompt','completion'}
+            assert [x['role'] for x in row['prompt']]==['system','user']
+            assert len(row['completion'])==1 and row['completion'][0]['role']=='assistant'
+            fingerprint=json.dumps(row,sort_keys=True)
+            assert fingerprint not in seen, 'Duplicate example'
+            seen.add(fingerprint)
+            output=json.loads(row['completion'][0]['content'])
+            assert set(output)=={'action','sql','message'}
+            assert output['action']==meta['action']
+            if output['action']=='query':
+                assert output['message'] is None
+                statements=parse_sql(output['sql'])
+                assert len(statements)==1
+                assert type(statements[0].stmt).__name__=='SelectStmt'
+                queries+=1
+                if conn:
+                    with conn.transaction():
+                        conn.execute('SET TRANSACTION READ ONLY')
+                        conn.execute("SET LOCAL statement_timeout = '10s'")
+                        cursor=conn.execute(output['sql'])
+                        cursor.fetchall()
+            else:
+                assert output['action'] in ('clarify','unsupported')
+                assert output['sql'] is None and output['message']
+            count+=1
+    if conn: conn.close()
+    report={'examples':count,'sql_queries':queries,'families':len(families),'json_contract':'passed','family_split_isolation':'passed','postgresql_parser':'passed','database_execution':'passed' if execute else 'not_run','semantic_result_correctness':'not_verified'}
+    (root/'validation_report.json').write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report,indent=2))
+
+    return report
+
+def convert_dataset(root: Path = ROOT):
+    output_dir = root / "converted"
+    output_dir.mkdir(exist_ok=True)
+
+    behaviors = []
+
+    for split in SPLITS:
+        converted = []
+
+        source = root / "data" / f"{split}.jsonl"
+        for line_number, line in enumerate(
+            source.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+
+            row = json.loads(line)
+            user_text = next(
+                message["content"]
+                for message in row["prompt"]
+                if message["role"] == "user"
+            )
+
+            schema, separator, question = user_text.partition("\n\nRequest:")
+            if not separator or not schema.startswith("Schema:\n"):
+                raise ValueError(f"{split}, line {line_number}: unexpected format")
+
+            schema = schema.removeprefix("Schema:\n").strip()
+            answer = json.loads(row["completion"][0]["content"])
+
+            if answer["action"] != "query":
+                behaviors.append({
+                    "split": split,
+                    "question": question.strip(),
+                    "schema": schema,
+                    "action": answer["action"],
+                    "message": answer["message"],
+                })
+                continue
+
+            converted.append({
+                "question": question.strip(),
+                "query": answer["sql"],
+                "schema": schema,
+            })
+
+        target = output_dir / f"{split}.jsonl"
+        target.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in converted),
+            encoding="utf-8",
+        )
+        print(f"{split}: {len(converted)} SQL examples")
+
+    (root / "behavior_examples.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in behaviors),
+        encoding="utf-8",
+    )
+    print(f"Separate behavioral examples: {len(behaviors)}")
+
+def load_converted_dataset(root: Path, splits=SPLITS):
+    from datasets import load_dataset
+
+    return load_dataset(
+        "json",
+        data_files={split: str(root / "converted" / f"{split}.jsonl") for split in splits},
+    )
+
+
+def assert_sql_columns(rows):
+    assert set(rows.column_names) == set(SQL_COLUMNS)
+
+def export_parquet(root: Path, loader=None):
+    output = root / "parquet"
+    output.mkdir(exist_ok=True)
+    dataset = (loader or load_converted_dataset)(root)
+    for split, rows in dataset.items():
+        assert_sql_columns(rows)
+        rows.to_parquet(str(output / f"{split}.parquet"))
+        print(f"{split}: {len(rows)} rows exported")
+    return dataset
+
+
+
+def upload_parquet(root: Path, repo_id: str, public: bool = False):
+    """Upload only a dataset card and the three Parquet splits in one commit."""
+    from huggingface_hub import HfApi, CommitOperationAdd
+
+    files = {f"data/{split}.parquet": root / "parquet" / f"{split}.parquet" for split in SPLITS}
+    for path in files.values():
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    card = """---
+language:
+- en
+license: cc-by-sa-3.0
+task_categories:
+- text-generation
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: data/train.parquet
+  - split: validation
+    path: data/validation.parquet
+  - split: test
+    path: data/test.parquet
+---
+# PostgreSQL Employees Text-to-SQL
+
+Synthetic schema-grounded SQL examples with columns `question`, `query`, and `schema`.
+The splits contain 256 training, 32 validation, and 32 test queries. Parameter variants
+of a query family remain in one split. Clarification and unsupported examples are
+retained locally and excluded from these Parquet files.
+
+PostgreSQL syntax is validated; semantic result correctness is not verified.
+Source schema: https://github.com/h8/employees-database. Original credits:
+Fusheng Wang, Carlo Zaniolo, Giuseppe Maxia, and Patrick Crews; PostgreSQL
+conversion maintained by h8. Changes: synthetic requests, queries, and family splits.
+Distribution: https://creativecommons.org/licenses/by-sa/3.0/
+"""
+    operations = [CommitOperationAdd(path_in_repo=remote, path_or_fileobj=str(local)) for remote, local in files.items()]
+    operations.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=card.encode("utf-8")))
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="dataset", private=not public, exist_ok=True)
+    api.create_commit(repo_id=repo_id, repo_type="dataset", operations=operations,
+                      commit_message="Upload validated PostgreSQL text-to-SQL Parquet splits")
+    url = f"https://huggingface.co/datasets/{repo_id}"
+    print(url)
+    return url
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo_id", nargs="?", help="YOUR_USERNAME/dataset-name; omit for a local-only run")
+    parser.add_argument("--public", action="store_true", help="Create a public repository; new repositories default to private")
+    parser.add_argument("--execute", action="store_true", help="Validate SQL execution using DATABASE_URL")
+    parser.add_argument("--output-dir", type=Path, default=ROOT, help="Root directory for generated artifacts")
+    args = parser.parse_args(argv)
+    if args.public and not args.repo_id:
+        parser.error("--public requires repo_id")
+    root = args.output_dir.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    generate_dataset(root)
+    validate_dataset(root, execute=args.execute)
+    convert_dataset(root)
+    export_parquet(root)
+    if args.repo_id:
+        upload_parquet(root, args.repo_id, public=args.public)
+
+
+if __name__ == "__main__":
+    main()
